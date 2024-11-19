@@ -39,7 +39,7 @@ Sensors:
 
 1. Clone the repository:
 ```bash
-git clone <repository_URL>
+git clone https://github.com/EduardoS0T/Weather-Station
 cd weather-station
 ```
 
@@ -69,7 +69,7 @@ enable_uart=1
 
 5. Run the program:
 ```bash
-streamlit run weather_station.py
+streamlit run main.py 
 ```
 
 ## Features
