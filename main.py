@@ -8,9 +8,7 @@ from datetime import datetime
 import signal
 import sys
 import math
-import logging
 import threading
-import streamlit as st
 from collections import deque
 
 # Configuración LCD
@@ -25,6 +23,30 @@ LCD_CHR = True
 LCD_CMD = False
 LCD_LINE_1 = 0x80
 LCD_LINE_2 = 0xC0
+
+def cleanup_gpio():
+    """Limpia todos los recursos GPIO antes de iniciar"""
+    try:
+        # Intentar abrir y cerrar chip para limpiar
+        h = lgpio.gpiochip_open(0)
+        # Limpiar pines LCD
+        for pin in [LCD_RS, LCD_E, LCD_D4, LCD_D5, LCD_D6, LCD_D7]:
+            try:
+                lgpio.gpio_free(h, pin)
+            except:
+                pass
+        # Limpiar pines de sensores
+        for pin in [17, 27, 22]:  # Pines del anemómetro, lluvia y DHT11
+            try:
+                lgpio.gpio_free(h, pin)
+            except:
+                pass
+        lgpio.gpiochip_close(h)
+    except:
+        pass
+    
+    # Esperar un momento para asegurar que los recursos se liberen
+    time.sleep(1)
 
 class LCD:
     def __init__(self):
@@ -107,7 +129,6 @@ class Anemometer:
             raise
     
     def _monitor_rotation(self):
-        """Hilo que monitorea continuamente las rotaciones"""
         last_calculation = time.time()
         local_count = 0
         
@@ -150,6 +171,7 @@ class Anemometer:
         if hasattr(self, 'h'):
             lgpio.gpio_free(self.h, self.pin)
             lgpio.gpiochip_close(self.h)
+
 class RainSensor:
     def __init__(self, pin):
         self.pin = pin
@@ -206,38 +228,90 @@ class LightSensor:
         try:
             i2c = busio.I2C(board.SCL, board.SDA)
             self.sensor = adafruit_tcs34725.TCS34725(i2c)
-            self.sensor.gain = 1
-            self.sensor.integration_time = 200
+            
+            # Configuración optimizada para mejor sensibilidad
+            self.sensor.gain = 60       # Máxima ganancia para mejor sensibilidad
+            self.sensor.integration_time = 100  # Tiempo de integración balanceado
+            self.sensor.led = False     # LED apagado
+            
+            time.sleep(0.5)  # Tiempo de estabilización
+            
         except Exception as e:
             print(f"Error Sensor de luz: {e}")
             raise
 
     def get_reading(self):
         try:
-            _, _, _, clear = self.sensor.color_raw
-            light_level = min(100, (clear / 1000) * 100)
+            # Obtener valores RGB y Clear raw
+            r, g, b, c = self.sensor.color_raw
             
-            # Determinar momento del día
-            hour = datetime.now().hour
-            if light_level < 20:
-                momento = "Noche"
+            # Calcular intensidad de luz en lux (aproximada)
+            lux = min(100, (c / 65535) * 100)
+            
+            # Calcular porcentajes RGB relativos al total
+            total = r + g + b
+            if total > 0:
+                r_percent = (r / total) * 100
+                g_percent = (g / total) * 100
+                b_percent = (b / total) * 100
             else:
-                if 6 <= hour < 12:
-                    momento = "Dia"
-                elif 12 <= hour < 18:
-                    momento = "Tarde"
-                else:
-                    momento = "Noche"
+                r_percent = g_percent = b_percent = 0
+                
+            # Crear mensaje descriptivo
+            intensidad = "Baja" if lux < 33 else "Media" if lux < 66 else "Alta"
             
             return {
-                'light_level': round(light_level, 1),
-                'momento': momento
+                'light_level': round(lux, 1),
+                'momento': f"Luz: {intensidad}",
+                'rgb_values': {
+                    'red': round(r_percent, 1),
+                    'green': round(g_percent, 1),
+                    'blue': round(b_percent, 1),
+                    'clear': c,
+                    'raw_r': r,
+                    'raw_g': g,
+                    'raw_b': b
+                }
             }
-        except:
+        except Exception as e:
+            print(f"Error en lectura del sensor: {e}")
             return {
                 'light_level': 0,
-                'momento': 'Error'
+                'momento': "Error",
+                'rgb_values': {
+                    'red': 0,
+                    'green': 0,
+                    'blue': 0,
+                    'clear': 0,
+                    'raw_r': 0,
+                    'raw_g': 0,
+                    'raw_b': 0
+                }
             }
+
+    def print_debug(self):
+        """
+        Imprime información detallada para debug
+        """
+        reading = self.get_reading()
+        rgb = reading['rgb_values']
+        print(f"""
+Lectura del sensor:
+------------------
+Intensidad de luz: {reading['light_level']}%
+Estado: {reading['momento']}
+
+Valores RGB (porcentaje del total):
+  Rojo:  {rgb['red']}%
+  Verde: {rgb['green']}%
+  Azul:  {rgb['blue']}%
+
+Valores raw:
+  Rojo:  {rgb['raw_r']}
+  Verde: {rgb['raw_g']}
+  Azul:  {rgb['raw_b']}
+  Clear: {rgb['clear']}
+""")
 
 class WeatherStation:
     def __init__(self):
@@ -253,7 +327,7 @@ class WeatherStation:
             self.light_sensor = LightSensor()
             
             # Buffer para datos históricos
-            self.data_buffer = deque(maxlen=1000)  # Mantener últimas 1000 lecturas
+            self.data_buffer = deque(maxlen=1000)
             
             self.lcd.lcd_string("Estacion Meteo", LCD_LINE_1)
             self.lcd.lcd_string("Iniciada!", LCD_LINE_2)
@@ -271,29 +345,24 @@ class WeatherStation:
             raise
 
     def _update_lcd(self):
-        """Hilo para actualizar el LCD"""
         display_index = 0
         while self.lcd_thread_running:
             if self.current_readings:
                 try:
                     if display_index == 0:
                         # Temperatura y Humedad
-                        self.lcd.lcd_string(f"Temp: {self.current_readings['temperature']}
-C", LCD_LINE_1)
-                        self.lcd.lcd_string(f"Hum: {self.current_readings['humidity']}%", 
-LCD_LINE_2)
+                        self.lcd.lcd_string(f"Temp: {self.current_readings['temperature']}C", LCD_LINE_1)
+                        self.lcd.lcd_string(f"Hum: {self.current_readings['humidity']}%", LCD_LINE_2)
                     elif display_index == 1:
                         # Viento y Lluvia
-                        self.lcd.lcd_string(f"Viento: {self.current_readings['wind_speed']
-}km/h", LCD_LINE_1)
-                        self.lcd.lcd_string("Lluvia: " + ("Si" if self.current_readings['i
-s_raining'] else "No"), LCD_LINE_2)
+                        self.lcd.lcd_string(f"Viento: {self.current_readings['wind_speed']}km/h", LCD_LINE_1)
+                        self.lcd.lcd_string("Lluvia: " + ("Si" if self.current_readings['is_raining'] else "No"), LCD_LINE_2)
                     else:
-                        # Luz y Momento
-                        self.lcd.lcd_string(f"Luz: {self.current_readings['light_level']}%
-", LCD_LINE_1)
-                        self.lcd.lcd_string(f"{self.current_readings['momento']}", LCD_LIN
-E_2)
+                        # Intensidad de luz y RGB
+                        if 'rgb_values' in self.current_readings and self.current_readings['rgb_values']:
+                            self.lcd.lcd_string(f"Luz: {self.current_readings['light_level']}%", LCD_LINE_1)
+                            rgb = self.current_readings['rgb_values']
+                            self.lcd.lcd_string(f"R:{rgb['red']}% G:{rgb['green']}%", LCD_LINE_2)
                     
                     display_index = (display_index + 1) % 3
                     time.sleep(3)
@@ -317,16 +386,13 @@ E_2)
             'wind_speed': wind_data['wind_speed'],
             'is_raining': rain_data['is_raining'],
             'light_level': light_data['light_level'],
-            'momento': light_data['momento']
+            'momento': light_data['momento'],
+            'rgb_values': light_data.get('rgb_values')
         }
         
         self.current_readings = readings
         self.data_buffer.append(readings)
         return readings
-
-    def get_historical_data(self):
-        """Retorna los datos históricos para gráficas"""
-        return list(self.data_buffer)
 
     def cleanup(self):
         try:
@@ -343,80 +409,26 @@ E_2)
             lgpio.gpiochip_close(self.lcd.h)
         except:
             pass
-def update_streamlit(weather_station):
-    """Actualiza la interfaz de Streamlit"""
-    st.title("Estación Meteorológica")
-    
-    # Contenedor para las métricas actuales
-    current_metrics = st.empty()
-    
-    # Contenedor para gráficas
-    charts = st.container()
-    
-    while True:
-        try:
-            # Obtener nuevas lecturas
-            readings = weather_station.get_readings()
-            
-            # Actualizar métricas
-            with current_metrics.container():
-                col1, col2, col3 = st.columns(3)
-                
-                # Columna 1: Temperatura y Humedad
-                with col1:
-                    st.metric("Temperatura", f"{readings['temperature']}°C")
-                    st.metric("Humedad", f"{readings['humidity']}%")
-                
-                # Columna 2: Viento y Lluvia
-                with col2:
-                    st.metric("Velocidad del Viento", f"{readings['wind_speed']} km/h")
-                    if readings['is_raining']:
-                        st.warning("🌧️ Lluvia detectada")
-                    else:
-                        st.success("☀️ Sin lluvia")
-                
-                # Columna 3: Luz y Momento del día
-                with col3:
-                    st.metric("Nivel de Luz", f"{readings['light_level']}%")
-                    st.info(f"Momento: {readings['momento']}")
-            
-            # Actualizar gráficas
-            with charts:
-                historical_data = weather_station.get_historical_data()
-                if historical_data:
-                    st.line_chart({
-                        'Temperatura': [d['temperature'] for d in historical_data],
-                        'Humedad': [d['humidity'] for d in historical_data]
-                    })
-                    st.line_chart({
-                        'Velocidad del Viento': [d['wind_speed'] for d in historical_data]
-                    })
-                    st.line_chart({
-                        'Nivel de Luz': [d['light_level'] for d in historical_data]
-                    })
-            
-            time.sleep(1)  # Actualizar cada segundo
-            
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
-            time.sleep(5)
 
 def main():
-    # Configurar streamlit
-    st.set_page_config(
-        page_title="Estación Meteorológica",
-        page_icon="🌡️",
-        layout="wide"
-    )
-    
     try:
+        # Limpiar GPIO antes de iniciar
+        print("Limpiando GPIO...")
+        cleanup_gpio()
+        
         # Inicializar estación
         station = WeatherStation()
         print("Estación iniciada correctamente")
         
-        # Iniciar interfaz Streamlit
-        update_streamlit(station)
-        
+        # Bucle principal
+        while True:
+            readings = station.get_readings()
+            # Debug de valores RGB
+            if readings['rgb_values']:
+                rgb = readings['rgb_values']
+                print(f"\nLuz: {readings['light_level']}% | R:{rgb['red']}% G:{rgb['green']}% B:{rgb['blue']}%")
+            time.sleep(1)
+            
     except KeyboardInterrupt:
         print("\nPrograma interrumpido por el usuario")
     except Exception as e:
@@ -424,6 +436,7 @@ def main():
     finally:
         if 'station' in locals():
             station.cleanup()
+        cleanup_gpio()
         print("Programa finalizado")
 
 if __name__ == "__main__":
